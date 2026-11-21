@@ -49,6 +49,7 @@ function cleanHeaders(raw) {
 const LOCAL_ONLY = [
   /^\/api\/mobile\/v1\/link\/code(\?|$)/,
   /^\/api\/mobile\/v1\/link\/panel(\?|$)/,
+  /^\/api\/mobile\/v1\/link\/qr\.svg(\?|$)/,
 ];
 
 function isLocalOnly(url) {
