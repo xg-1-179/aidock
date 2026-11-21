@@ -34,8 +34,9 @@ function cleanHeaders(raw) {
   for (const [k, v] of Object.entries(raw)) {
     const low = k.toLowerCase();
     if (HOP_BY_HOP.has(low)) continue;
-    // 客户端伪造的 x-aidock-* 一律丢掉：下面要自己盖一枚「这是公网来路」的章。
-    if (low.startsWith('x-aidock-')) continue;
+    // 客户端伪造的 x-aidock-edge 一律丢掉：下面要自己盖一枚「这是公网来路」的章。
+    // 注意只丢这一枚 —— `x-aidock-code` 是手机配对时正经带过来的六位连接码，不能动。
+    if (low === 'x-aidock-edge') continue;
     out[k] = v;
   }
   out['x-aidock-edge'] = '1';
