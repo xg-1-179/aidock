@@ -17,11 +17,25 @@
 ## 装法
 
 ```bash
-dsh plugin --profile web add aidock        # 装到 profile
-# 或在源码目录里：dsh plugin --profile web add "file:<本仓库路径>"
+# 1) 从 GitHub 装（推荐；需要 dsh >= 0.2.0）
+dsh plugin --profile web add github:xg-1-179/aidock
+
+# 2) 本地源码 / 打包出来的 tgz
+npm pack                                  # 生成 aidock-0.1.0.tgz
+dsh plugin --profile web add "file:<绝对路径>/aidock-0.1.0.tgz"
 ```
 
-装完在「设置 → 移动端」里打开配置页；直连端口默认 41873，可在配置里改。
+装完后：
+
+- `dsh plugin --profile web list` 里能看到 `aidock@x.y.z`，profile 的 `package.json`
+  的 bundles 里会多一条 `aidock`（这一条决定它的 patch 层会不会被加载）；
+- 打开 DSH 设置 → 移动端，能看到面板入口；
+- 直连端口默认 `41873`，可在面板里改。
+
+**注意包名一致性**：`package.json` 的 `name` 与 `cordis.patch.yml` 里
+`insert: [{ id: dsh-mobile, name: 'aidock' }]` 必须一致。Loader 是按这个名字在
+profile 的 `node_modules` 里解析入口的；写错会让整棵插件树加载失败（不是一条警告）。
+派生改名时 `host.js` 的 `BIN_NAME` 已改成从 `package.json` 读，不用再手工改。
 
 ## 手机怎么连
 
