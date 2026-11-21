@@ -32,12 +32,35 @@ const HOP_BY_HOP = new Set([
 function cleanHeaders(raw) {
   const out = {};
   for (const [k, v] of Object.entries(raw)) {
-    if (!HOP_BY_HOP.has(k.toLowerCase())) out[k] = v;
+    const low = k.toLowerCase();
+    if (HOP_BY_HOP.has(low)) continue;
+    // 客户端伪造的 x-aidock-* 一律丢掉：下面要自己盖一枚「这是公网来路」的章。
+    if (low.startsWith('x-aidock-')) continue;
+    out[k] = v;
   }
+  out['x-aidock-edge'] = '1';
   return out;
 }
 
+// 只允许本机访问的路径。转发口面向公网，而宿主看到的源地址恒为 127.0.0.1，
+// 它自己分不清「真在本机」还是「从公网绕进来」——六位码页面若被外面读到，
+// 等于把一台权限全开的设备送给任何人。所以在这一层直接挡掉。
+const LOCAL_ONLY = [
+  /^\/api\/mobile\/v1\/link\/code(\?|$)/,
+  /^\/api\/mobile\/v1\/link\/panel(\?|$)/,
+];
+
+function isLocalOnly(url) {
+  const path = String(url || '');
+  return LOCAL_ONLY.some((re) => re.test(path));
+}
+
 const server = http.createServer((req, res) => {
+  if (isLocalOnly(req.url)) {
+    res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ ok: false, error: { code: 'local-only', message: '只允许在本机打开' } }));
+    return;
+  }
   const proxy = http.request(
     {
       host: TARGET_HOST,
