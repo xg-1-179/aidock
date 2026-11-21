@@ -1,0 +1,814 @@
+'use strict';
+// 安装包身份（包名 / 构建号 / 渠道）随设备记录存下，AI 反馈提交要从这里取（2026-11-18）。
+// 有效设备记录保留本地重新发现能力，未知设备禁止自动换入口。
+// 电脑网页授权独立于手机权限；调整设备权限会同步收回该授权。
+
+/**
+ * 每设备凭据库：签发、校验、吊销手机端的持久化凭据。
+ *
+ * **凭据本身就是 Bearer**。配对签发一枚
+ * `<instanceId>.<exp>.<random>`，同一枚同时充当 `Authorization: Bearer`、`dsh_lan` cookie
+ * 与 `X-Dsh-Device-Credential`。三段形状只为兼容老 App「实例号缺失时从第一段补」那条逻辑；
+ * 服务端**只按整串的 sha256 查库**，不看前缀、不解析三段、也不信里面的 `exp`
+ * （以记录的 `expiresAt` 为准）。
+ *
+ * 落盘只存整串的 sha256。**唯一的例外是 `deviceKey`**：协议 v2 的逐请求签名要拿它重算，
+ * 验签必须持有密钥本身，所以它按 base64url 原文落盘 —— 「整库只有哈希」这句话在它身上不成立。
+ * `hostToken` 只为旧的 HMAC 记录保留：新记录一律留空，代理直接转发请求里出示的那一枚。
+ *
+ * 写入只有一个方向：宿主主进程是唯一写方；旁路子进程拿的是只读副本，靠文件
+ * mtime/size 变了就重载来跟住变化，签发与吊销走 IPC 交给主进程（`lib/impl.js`）。
+ *
+ * 设备清单（`listDevices`）只画还活着的；已解绑的那部分由 `listHistory` 聚合出来。
+ * 两份是同一趟扫描的两半（`scanDevices`）：键与「取最新有值」的口径只写一份，路由要两份时
+ * 也只扫一遍。历史那半与清理共用同一个保留窗口，纯读、不写盘。
+ *
+ * `clearHistory` 是面板「一键清空历史」的落点：只删本实例**已结束**的手机记录，活着的凭据
+ * 与电脑网页授权一条不碰（同一个 deviceId 解绑后又重配的，旧记录删掉、新记录留着）。它比
+ * `prune` 更彻底——一次把所有已结束的都清掉，包括超出窗口、原本要等下次写入才被 prune 的
+ * 残余；两者都不轮换密钥、不影响任何还能用的通行证。只读副本拒绝，与 `revoke` 同理：清了
+ * 不落盘、下次重载复活。
+ *
+ * 换身份（`rotateIdentity`）时由宿主调 `reassignInstance`：把本机签发的**全部**记录整体换到
+ * 新实例号下。凭据串整串哈希查库、记录里的 `instanceId` 只是归属，所以改归属不动凭据串本身
+ * （手机上那枚照样验得过），换号对已配对设备完全透明，不需要重新扫码。
+ */
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
+const os = require('node:os');
+
+const FILE = process.env.DEVICE_CREDENTIALS_FILE || path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'relay-device-credentials.json');
+/** 默认有效期一年。`issue(..., ttlMs)` 可覆盖；`ttlMs <= 0` 表示不过期。 */
+const DEFAULT_TTL_MS = 365 * 24 * 3600 * 1000;
+/** 已吊销或过期超过这么久的记录，下次写入时整条删掉：别让每条请求扫一整年的账。 */
+const PRUNE_GRACE_MS = 30 * 24 * 3600 * 1000;
+/** 「已解绑」历史能回溯多久。取的就是清理窗口：面板说「只保留最近 N 天」，那个 N 必须
+ * 是库真正会留住的时长，另立一个数就会说出与库对不上的话。 */
+const HISTORY_RETENTION_MS = PRUNE_GRACE_MS;
+/** 剩余有效期超过这个比例就不续期：滑动续期只在过掉一半之后发生。 */
+const RENEW_BELOW_RATIO = 0.5;
+/** 设备元信息的落盘截断长度。名字 64 够放「某某的 iPhone 15 Pro Max」；其余是系统版本、 */
+/** App 版本这类短标识，来源是手机自填，长度不可信。 */
+const NAME_MAX = 64;
+const FIELD_MAX = 32;
+/** 一份镜像最多带这么多条摘要：长期反复配对不该把推送清单撑成累赘。 */
+const MAX_ACTIVE_DIGESTS = 200;
+/** `lastSeenAt` 落盘的全局节流。 */
+const TOUCH_FLUSH_MS = 60 * 1000;
+
+let loaded = false;
+let records = [];
+/** `hash -> record`：每次整体替换，跟着 `records` 一起重建。 */
+let byHash = new Map();
+/** 上次读到的文件指纹（mtime:size）。 */
+let stamp = null;
+/** 只读副本：不写盘、不续期，改动只活在内存里直到下一次重载。 */
+let readOnly = false;
+let lastTouchFlushAt = 0;
+
+function digest(value) { return crypto.createHash('sha256').update(String(value)).digest('hex'); }
+
+/** 恒时比较两份摘要。两边都是 64 字符 hex，长度一致，能用 timingSafeEqual。 */
+function hashEquals(a, b) {
+  const left = Buffer.from(String(a), 'utf8');
+  const right = Buffer.from(String(b), 'utf8');
+  if (left.length !== right.length) return false;
+  return crypto.timingSafeEqual(left, right);
+}
+
+/** 文件指纹。读不到就是 null（还不存在 / 刚被删）。 */
+function statOf() {
+  try {
+    const stat = fs.statSync(FILE);
+    return `${stat.mtimeMs}:${stat.size}`;
+  } catch {
+    return null;
+  }
+}
+
+function rebuildIndex() {
+  byHash = new Map();
+  for (const record of records) byHash.set(record.hash, record);
+}
+
+function readFromDisk() {
+  try {
+    const data = JSON.parse(fs.readFileSync(FILE, 'utf8'));
+    records = Array.isArray(data)
+      ? data.filter((record) => record && typeof record === 'object' && typeof record.hash === 'string' && record.hash)
+      : [];
+  } catch {
+    records = [];
+  }
+  // 权限档位已移除：所有设备一律全权。老记录若还带 `permissions` 子集，读到就抹掉
+  //（缺 `permissions` = 全权，与权限判定口径一致），下一次写盘即成全权。
+  for (const record of records) {
+    if (Object.prototype.hasOwnProperty.call(record, 'permissions')) delete record.permissions;
+  }
+  stamp = statOf();
+  rebuildIndex();
+}
+
+/** 第一次用到时读一次盘。之后是否重读由 `refresh()` 按文件指纹决定。 */
+function load() {
+  if (loaded) return;
+  loaded = true;
+  readFromDisk();
+}
+
+function save() {
+  if (readOnly) return;
+  fs.mkdirSync(path.dirname(FILE), { recursive: true });
+  const tmp = `${FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(records, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, FILE);
+  stamp = statOf();
+}
+
+/**
+ * 只读副本按文件指纹重载。
+ *
+ * 这是**缓存失效而不是防御**：它替代的是「每条请求都跨进程问一次主进程」，而鉴权是热路径
+ * （每台手机每秒好几个请求），跨进程问比一次 stat 贵得多。指纹没变就一个系统调用都不做。
+ * 主进程（唯一写方）调它也没坏处：自己刚写完指纹就是新的，立刻返回。
+ */
+function refresh() {
+  load();
+  const now = statOf();
+  if (now === stamp) return false;
+  readFromDisk();
+  return true;
+}
+
+/** 切只读副本。只影响写盘与续期，读路径不变。 */
+function setReadOnly(flag) { readOnly = flag !== false; }
+
+function isReadOnly() { return readOnly; }
+
+function truncate(value, max) {
+  if (typeof value !== 'string') return '';
+  const text = value.trim();
+  return text ? text.slice(0, max) : '';
+}
+
+/** 设备自填的元信息：只留这几个，各自截断。空值不写，面板据此显示「未知设备」。 */
+function deviceMeta(device) {
+  const meta = {};
+  const name = truncate(device?.name, NAME_MAX);
+  if (name) meta.name = name;
+  // 机型（「iPhone 15 Pro」/「Xiaomi 9」）：名字是用户起的、两台可能一模一样，机型是手机
+  // 自己报的，用来补上「这台到底是什么」。缺了就不写 —— 判重仍只看 `deviceId`。
+  const model = truncate(device?.model, NAME_MAX);
+  if (model) meta.model = model;
+  const platform = truncate(device?.platform, FIELD_MAX);
+  if (platform) meta.platform = platform;
+  const osVersion = truncate(device?.osVersion ?? device?.version, FIELD_MAX);
+  if (osVersion) meta.osVersion = osVersion;
+  const appVersion = truncate(device?.appVersion, FIELD_MAX);
+  if (appVersion) meta.appVersion = appVersion;
+  // 安装包三格（2026-11-18）：包名 / 构建号 / 渠道。反馈工具提交到分发平台时要按真实安装包
+  // 报，缺了就不写（老 App 不带这几格，不能把已有值冲成空）。
+  const packageId = truncate(device?.packageId, FIELD_MAX);
+  if (packageId) meta.packageId = packageId;
+  const buildNumber = truncate(device?.buildNumber, FIELD_MAX);
+  if (buildNumber) meta.buildNumber = buildNumber;
+  const channel = truncate(device?.channel, FIELD_MAX);
+  if (channel) meta.channel = channel;
+  if (device?.lanDiscovery === 1 || device?.lanDiscovery === 0) meta.lanDiscovery = device.lanDiscovery;
+  return meta;
+}
+
+/**
+ * 已吊销、或过期超过宽限期的整条删掉。
+ *
+ * 旧库只追加、吊销只打标记，今天不疼是因为「查不到就回退验 HMAC」把问题掩盖成了可用；
+ * 查库优先之后，每条请求都要扫整张表，一年下来几千条就是每条请求扫几千次。
+ */
+function prune(now = Date.now()) {
+  const before = records.length;
+  records = records.filter((record) => {
+    if (record.revokedAt && now - record.revokedAt > PRUNE_GRACE_MS) return false;
+    if (record.expiresAt && record.expiresAt + PRUNE_GRACE_MS < now) return false;
+    return true;
+  });
+  if (records.length !== before) rebuildIndex();
+  return before - records.length;
+}
+
+/**
+ * 签发一条记录。
+ *
+ * `extra` 带协议 v2 的密钥材料（`deviceKey` / `keyId`）。老形状（只带 6 位码）没有密钥材料，
+ * 那种记录不带 `deviceKey`，设备列表按「旧式」显示、撤销文案也不同。
+ *
+ * 返回的 `credential` 是**整串 Bearer**：同一枚同时进 `token` / `cookie` / `deviceCredential`。
+ * `hostToken` 形参只为兼容旧调用方保留，新记录一律不存。
+ */
+function issue(instanceId, device, hostToken, ttlMs = DEFAULT_TTL_MS, extra = {}) {
+  load();
+  // 只读副本不许签发：它写在内存里的那条既不会落盘、也会被下一次重载抹掉，于是
+  // 「配上了但立刻查不到」这种半截状态只会在真机联调时以随机 401 的形式出现。
+  // 旁路子进程要签发走 IPC 交给主进程（`lib/impl.js` 的 `/internal/issue-credential`）。
+  if (readOnly) {
+    const error = new Error('凭据库的只读副本不能签发；旁路子进程请经 IPC 交给主进程');
+    error.code = 'READ_ONLY';
+    throw error;
+  }
+  const deviceId = String(device?.deviceId || device?.id || crypto.randomUUID()).slice(0, 128);
+  const random = crypto.randomBytes(32).toString('base64url');
+  const now = Date.now();
+  const expiresAt = Number.isFinite(ttlMs) && ttlMs > 0 ? now + ttlMs : null;
+  const credential = `${instanceId}.${expiresAt === null ? 0 : Math.floor(expiresAt / 1000)}.${random}`;
+  const record = {
+    instanceId,
+    deviceId,
+    hash: digest(credential),
+    hostToken: typeof hostToken === 'string' ? hostToken : '',
+    createdAt: now,
+    ...(expiresAt !== null ? { expiresAt } : {}),
+    format: 't1',
+    ...deviceMeta(device),
+  };
+  const deviceKey = typeof extra?.deviceKey === 'string' ? extra.deviceKey : '';
+  const keyId = typeof extra?.keyId === 'string' ? extra.keyId : '';
+  if (deviceKey) record.deviceKey = deviceKey;
+  if (keyId) record.keyId = keyId;
+  // 按设备发放的权限子集（`lib/mobile/permissions.js` 是唯一真源）。
+  // **只在真给了数组时才写这一格**：不写 = 全权，这是老记录与现网设备的兼容命门，
+  // 绝不能在这里补一个默认数组把「没设置」变成「设置成某个子集」。
+  if (Array.isArray(extra?.permissions)) record.permissions = extra.permissions.slice();
+  if (extra?.remoteWeb === true && deviceKey && keyId) { record.remoteWeb = true; record.kind = 'computer'; }
+  prune(now);
+  records.push(record);
+  rebuildIndex();
+  save();
+  // 刚写过盘，所以接下来一分钟内的 `touch` 不必再写一次（节流基准跟着这次写走）。
+  lastTouchFlushAt = now;
+  return {
+    credential,
+    deviceId,
+    expiresAt,
+    ...(keyId ? { keyId } : {}),
+    ...(Array.isArray(record.permissions) ? { permissions: record.permissions.slice() } : {}),
+  };
+}
+
+/**
+ * 改一台设备名下所有活记录的权限集合（电脑侧授予 / 手机侧自助降档都走它）。
+ *
+ * 只改 `permissions` 这一格：凭据串本身不动（库按整串哈希查，改一个字节手机上那枚就对不上，
+ * 只能重新签发、也就是重新扫码）。同一台手机名下可能有好几条活记录（重配、升级留下的），
+ * 一起改，否则「这台是只读」只对最新那条生效、旧的那枚照样全权。
+ *
+ * @returns {number} 改了几条
+ */
+function setDevicePermissions(instanceId, deviceId, permissions) {
+  load();
+  if (readOnly) {
+    const error = new Error('凭据库的只读副本不能改权限；旁路子进程请经 IPC 交给主进程');
+    error.code = 'READ_ONLY';
+    throw error;
+  }
+  if (!Array.isArray(permissions)) return 0;
+  const wanted = permissions.slice();
+  let count = 0;
+  for (const record of records) {
+    if (record.instanceId !== instanceId || record.deviceId !== deviceId || !isLive(record)) continue;
+    record.permissions = wanted.slice();
+    if (record.remoteWeb === true) record.remoteWeb = false;
+    count += 1;
+  }
+  if (count) save();
+  return count;
+}
+
+/**
+ * 查记录（不看是否有效）。
+ *
+ * `find()` 回答「能不能放行」，这个回答「我们是不是签发过」。区别是承重的：桌面宿主与中转
+ * 各有自己的库，公网配对时凭据由中转签、宿主没见过，那枚必须回退到无状态令牌；而宿主
+ * **确实签发过**的凭据必须以记录为准，否则吊销永远不生效。
+ */
+function lookup(credential, instanceId) {
+  // **必须 refresh，不能只 load**：旁路子进程持的是只读副本，`load()` 一生只读一次盘，
+  // 于是「子进程起来之后才配对的设备」在这条路上永远查不到 —— 表现是局域网口一律 401
+  // （普通请求与 Metro 的预览通道都过不去），App 只能退回公网中转。文件指纹变了才重读，
+  // 稳态下只多一次 stat。
+  refresh();
+  if (typeof credential !== 'string' || !credential) return null;
+  const record = byHash.get(digest(credential));
+  if (!record) return null;
+  if (instanceId && record.instanceId !== instanceId) return null;
+  return record;
+}
+
+/** 查一条仍然有效的记录。 */
+function find(credential, instanceId) {
+  const record = lookup(credential, instanceId);
+  return record && isLive(record) ? record : null;
+}
+
+/** 记录是否既没被吊销也没过期。 */
+function isLive(record, now = Date.now()) {
+  return Boolean(record) && !record.revokedAt && (!record.expiresAt || record.expiresAt > now);
+}
+
+/**
+ * 按密钥标识找设备密钥（协议 v2 的验签入口）。
+ *
+ * **必须按 keyId，不能按 deviceId**：deviceId 是手机自填的，克隆/迁移后会撞，撞了就是
+ * 「两台手机能用同一把密钥验签」。keyId 是配对时宿主生成的 8 字节随机，不会撞。
+ */
+function findByKeyId(instanceId, keyId) {
+  refresh();
+  if (typeof keyId !== 'string' || !keyId) return null;
+  const now = Date.now();
+  for (let i = records.length - 1; i >= 0; i -= 1) {
+    const record = records[i];
+    if (record.instanceId !== instanceId || record.keyId !== keyId) continue;
+    // 同一 keyId 只可能有一条（当场生成的随机），命中即终局：不 live 就按不认识处理，
+    // 别继续往上翻旧记录 —— 那等于让吊销过的 keyId 靠更老的一条复活。
+    return isLive(record, now) ? record : null;
+  }
+  return null;
+}
+
+/** 电脑通道只用它签署已吊销/到期的拒绝，不把失效记录恢复为授权。 */
+function lookupRemoteByKeyId(instanceId, keyId) {
+  refresh();
+  if (typeof keyId !== 'string' || !keyId) return null;
+  for (let i = records.length - 1; i >= 0; i -= 1) {
+    const record = records[i];
+    if (record.instanceId === instanceId && record.keyId === keyId && record.deviceKey) return record;
+  }
+  return null;
+}
+
+/**
+ * 记一次「这台设备刚连上过」。
+ *
+ * 内存里每次都更新（面板 3 秒轮询要的是当下的值），落盘按全局 1 分钟节流：每条请求都写一次
+ * 盘，是拿磁盘换一个只用来显示「几分钟前」的字段。`issue` / `revoke` 立刻写，不受它影响。
+ */
+function touch(record, info = {}) {
+  load();
+  if (!record || typeof record !== 'object') return false;
+  const now = Date.now();
+  record.lastSeenAt = now;
+  const channel = typeof info.channel === 'string' ? info.channel : '';
+  if (channel) record.lastChannel = channel.slice(0, FIELD_MAX);
+  // 身份那几格：名字 / 平台 / 系统版本 / App 版本由**每一次请求**带上来，
+  // 顺手刷新。它们以前只在配对那一刻写一次，于是「手机升到新版了、面板还报配对时的旧版本」，
+  // 而旧会话升级写进来的记录干脆什么身份都没有（面板只能画「未知设备」）。
+  // **只写这次真带了值的格子**：老版本 App 不带头，绝不能把已经有的名字冲成空。
+  const meta = deviceMeta(info.meta);
+  let metaChanged = false;
+  for (const key of Object.keys(meta)) {
+    if (record[key] !== meta[key]) {
+      record[key] = meta[key];
+      metaChanged = true;
+    }
+  }
+  if (readOnly) return true;
+  // 身份变了必须落盘（那是面板唯一能看到的来源）；只刷新「刚连上过」才走老的一分钟节流。
+  if (!metaChanged && now - lastTouchFlushAt < TOUCH_FLUSH_MS) return true;
+  lastTouchFlushAt = now;
+  save();
+  return true;
+}
+
+/**
+ * 滑动续期：剩余不到一半就把 `expiresAt` 后推一个新 TTL。
+ *
+ * 不需要新协议 —— 服务端本来就以记录为准、不验 token 里的 `exp`，所以续期就是改这条记录。
+ * **不能改 token 本身**：库按整串哈希查，改一个字节手机上那枚就对不上了。
+ * 只读副本不续期：写盘是主进程的事，旁路续了会被主进程那份覆写掉。
+ */
+function renew(record, ttlMs = DEFAULT_TTL_MS) {
+  load();
+  if (readOnly || !record || typeof record !== 'object' || !record.expiresAt) return false;
+  if (!Number.isFinite(ttlMs) || ttlMs <= 0) return false;
+  const now = Date.now();
+  if (record.expiresAt - now > ttlMs * RENEW_BELOW_RATIO) return false;
+  record.expiresAt = now + ttlMs;
+  prune(now);
+  save();
+  return true;
+}
+
+function revoke(credential, instanceId) {
+  load();
+  // 只读副本吊销了也不落盘，下一次重载就「复活」—— 这种「看起来成功、其实没生效」
+  // 正是吊销最不能有的失败形态。旁路的吊销同样走 IPC 交给主进程。
+  if (readOnly) {
+    const error = new Error('凭据库的只读副本不能吊销；旁路子进程请经 IPC 交给主进程');
+    error.code = 'READ_ONLY';
+    throw error;
+  }
+  const record = lookup(credential, instanceId);
+  if (!record || record.revokedAt) return false;
+  record.revokedAt = Date.now();
+  prune();
+  save();
+  return true;
+}
+
+/** 吊销一台设备名下**所有**仍有效的记录：同一台手机重配几次就是几条。 */
+function revokeDevice(instanceId, deviceId) {
+  load();
+  const now = Date.now();
+  let count = 0;
+  for (const record of records) {
+    if (record.instanceId !== instanceId || record.deviceId !== deviceId || record.revokedAt) continue;
+    record.revokedAt = now;
+    count += 1;
+  }
+  if (count && !readOnly) { prune(now); save(); }
+  return count;
+}
+
+/** 吊销本实例的全部记录。轮换 `lanSecret` 另算，那一刀专杀旧 HMAC。 */
+function revokeAllByInstance(instanceId) {
+  load();
+  const now = Date.now();
+  let count = 0;
+  for (const record of records) {
+    if (record.instanceId !== instanceId || record.revokedAt) continue;
+    record.revokedAt = now;
+    count += 1;
+  }
+  if (count && !readOnly) { prune(now); save(); }
+  return count;
+}
+
+/**
+ * 把本机签发的**全部**凭据整体迁到新实例号下（换身份时用）。
+ *
+ * 为什么是「全部」而不是「上一代那一个」：换号只认「当前号 + 上一代号」，换到第二次时，
+ * 挂在更早一代、又没来得及换过来的手机就会被甩下、只能重新扫码。这里不看记录当前挂在哪一代，
+ * 一律改成 `toInstanceId`——库里每条记录都是本机签发的，历史各代都是本机的旧身份，统一收到
+ * 新号下，换几次都对已配对设备透明。
+ *
+ * 只改归属那一格，凭据串（及其哈希）不动：手机上那枚照旧验得过，吊销/到期/密钥验签/设备清单
+ * 也都按新号对齐。只读副本拒绝，与 `revoke` 同理。
+ *
+ * @returns {number} 改了几条（已经是目标号的跳过）
+ */
+function reassignInstance(toInstanceId) {
+  load();
+  if (readOnly) {
+    const error = new Error('凭据库的只读副本不能换归属；旁路子进程请经 IPC 交给主进程');
+    error.code = 'READ_ONLY';
+    throw error;
+  }
+  const target = String(toInstanceId || '');
+  if (!target) return 0;
+  let count = 0;
+  for (const record of records) {
+    if (record.instanceId === target) continue;
+    record.instanceId = target;
+    count += 1;
+  }
+  // `byHash` 按整串摘要建索引，与 `instanceId` 无关，改归属不必重建；只有写盘。
+  if (count) save();
+  return count;
+}
+
+/** 本实例仍有效的电脑网页授权，只返回管理清单需要的公开字段。 */
+function listRemoteComputers(instanceId) {
+  refresh();
+  const now = Date.now();
+  const devices = new Map();
+  for (const record of records) {
+    if (record.instanceId !== instanceId || record.remoteWeb !== true || !isLive(record, now)) continue;
+    const previous = devices.get(record.deviceId);
+    if (!previous || record.createdAt > previous.createdAt) devices.set(record.deviceId, {
+      deviceId: record.deviceId, name: record.name || '', platform: record.platform || '',
+      lastSeenAt: Number(record.lastSeenAt) || 0, createdAt: Number(record.createdAt) || 0,
+    });
+  }
+  return [...devices.values()];
+}
+
+function listActive() {
+  load();
+  const now = Date.now();
+  return records
+    .filter((record) => isLive(record, now))
+    .map(({ instanceId, deviceId, createdAt, expiresAt, lanDiscovery, kind }) => ({ instanceId, deviceId, createdAt, ...(expiresAt ? { expiresAt } : {}), ...(lanDiscovery !== undefined ? { lanDiscovery } : {}), ...(kind ? { kind } : {}) }));
+}
+
+/**
+ * 两张设备清单共用的一趟扫描。
+ *
+ * 面板要的两份东西 —— 还活着的设备、已解绑的历史 —— 键与字段口径是同一套：都按 `deviceId`
+ * 聚成一行，身份几格（名字 / 机型 / 平台 / 系统版本 / App 版本）都取最新一条**有值的**，
+ * 空的不覆盖有值的。各扫一遍就等于把这套判据抄两份，改一处忘另一处、两边迟早说出不一样的话；
+ * 而路由那一发本来就要两份同时要（活清单 + 历史条数），扫两遍纯属白跑。所以聚合只写一次，
+ * 两条分支各自决定哪些记录进自己那半。
+ *
+ * 返回 `{ active, history }`：`active` 是活动清单的行，`history` 是已解绑的行。
+ */
+function scanDevices(instanceId, now = Date.now()) {
+  load();
+  const active = new Map();
+  const history = new Map();
+  /** 名下有过活记录的 deviceId：这种设备在活动清单里已经有一行，历史那半不能再出现它。 */
+  const living = new Set();
+  for (const record of records) {
+    if (record.instanceId !== instanceId || record.kind === 'computer') continue;
+    const key = String(record.deviceId || '');
+    const createdAt = Number(record.createdAt) || 0;
+    if (isLive(record, now)) {
+      living.add(key);
+      let row = active.get(key);
+      if (!row) {
+        row = activeRow(key, createdAt);
+        active.set(key, row);
+      }
+      row.bindings += 1;
+      if (!record.deviceKey) row.legacy = true;
+      // 带设备密钥的记录才走逐请求签名；只带 6 位码配对的那个版本永远是明文。
+      if (record.deviceKey) row.encrypted = true;
+      // 权限子集取最新一条**真设过**的记录（老记录没这一格，不覆盖）；一条都没设过就保持
+      // null = 全权，面板据此显示「全权」。`tags` 不像机型号那样按时间比，是因为它只有
+      // 「设过 / 没设过」两种：降档会写全部活记录（见 setDevicePermissions）。
+      if (Array.isArray(record.permissions) && createdAt >= (row.permissionsAt || 0)) {
+        row.permissions = record.permissions.slice();
+        row.permissionsAt = createdAt;
+      }
+      accumulateDevice(row, record, createdAt);
+      continue;
+    }
+    // 与 `prune` 同口径：两次清理之间库里可能还留着一点边缘数据，查询自己再滤一遍，
+    // 免得「列表里算过的、历史里算不进去」对不上。
+    if (record.revokedAt && now - record.revokedAt > HISTORY_RETENTION_MS) continue;
+    if (record.expiresAt && record.expiresAt + HISTORY_RETENTION_MS < now) continue;
+    let row = history.get(key);
+    if (!row) {
+      row = historyRow(key);
+      history.set(key, row);
+    }
+    row.bindings += 1;
+    if (record.revokedAt) {
+      row.revokedAt = Math.max(row.revokedAt, Number(record.revokedAt) || 0);
+      row.kind = 'revoked';
+    }
+    accumulateDevice(row, record, createdAt);
+  }
+  return { active: activeOut(active), history: historyOut(history, living) };
+}
+
+/** 活动清单的一行。字段名与 `listDevices` 的返回一致；`modelAt` 那几格是内部临时值，最后剥掉。 */
+function activeRow(deviceId, createdAt) {
+  return {
+    deviceId,
+    name: '',
+    model: '',
+    platform: '',
+    osVersion: '',
+    appVersion: '',
+    packageId: '',
+    buildNumber: '',
+    channel: '',
+    boundAt: createdAt,
+    lastSeenAt: 0,
+    lastChannel: '',
+    lastSeenFrom: 0,
+    bindings: 0,
+    suffix: '',
+    legacy: false,
+    encrypted: false,
+    expiresAt: 0,
+    permissions: null,
+  };
+}
+
+/** 已解绑清单的一行。`kind` 先按到期摆着，组内出现过 `revokedAt` 就翻成 `revoked`。 */
+function historyRow(deviceId) {
+  return {
+    deviceId,
+    name: '',
+    model: '',
+    platform: '',
+    osVersion: '',
+    appVersion: '',
+    boundAt: 0,
+    lastSeenAt: 0,
+    lastChannel: '',
+    lastSeenFrom: 0,
+    revokedAt: 0,
+    expiresAt: 0,
+    kind: 'expired',
+    bindings: 0,
+  };
+}
+
+/**
+ * 两条分支共用的累加：绑定时间取这一组最早的，最近连接取最大并跟着取那一条的通道，
+ * 身份几格取最新一条有值的（老记录这些字段是空的，空不能覆盖有值）。只写这里一份。
+ */
+function accumulateDevice(row, record, createdAt) {
+  if (createdAt && (!row.boundAt || createdAt < row.boundAt)) row.boundAt = createdAt;
+  if (record.model && createdAt >= (row.modelAt || 0)) { row.model = record.model; row.modelAt = createdAt; }
+  if (record.name && createdAt >= (row.nameAt || 0)) { row.name = record.name; row.nameAt = createdAt; }
+  if (record.platform && createdAt >= (row.platformAt || 0)) { row.platform = record.platform; row.platformAt = createdAt; }
+  if (record.osVersion && createdAt >= (row.osVersionAt || 0)) { row.osVersion = record.osVersion; row.osVersionAt = createdAt; }
+  if (record.appVersion && createdAt >= (row.appVersionAt || 0)) { row.appVersion = record.appVersion; row.appVersionAt = createdAt; }
+  if (record.packageId && createdAt >= (row.packageIdAt || 0)) { row.packageId = record.packageId; row.packageIdAt = createdAt; }
+  if (record.buildNumber && createdAt >= (row.buildNumberAt || 0)) { row.buildNumber = record.buildNumber; row.buildNumberAt = createdAt; }
+  if (record.channel && createdAt >= (row.channelAt || 0)) { row.channel = record.channel; row.channelAt = createdAt; }
+  const seenAt = Number(record.lastSeenAt) || 0;
+  if (seenAt >= row.lastSeenFrom) {
+    row.lastSeenFrom = seenAt;
+    row.lastSeenAt = seenAt;
+    if (record.lastChannel) row.lastChannel = record.lastChannel;
+  }
+  if (record.expiresAt) row.expiresAt = Math.max(row.expiresAt, Number(record.expiresAt) || 0);
+}
+
+function activeOut(rows) {
+  // 撞名才编号：分组用的正是面板拿来当标题的那一格 —— **机型优先，没有机型才用名字**。
+  // 两台都叫「iPhone 15 Pro」时「· 1 / · 2」是人认得出的；挂着机器号后四位则不是。
+  const groups = new Map();
+  for (const row of rows.values()) {
+    const label = row.model || row.name || '';
+    const bucket = groups.get(label);
+    if (bucket) bucket.push(row);
+    else groups.set(label, [row]);
+  }
+  for (const bucket of groups.values()) {
+    if (bucket.length < 2) continue;
+    const ordered = [...bucket].sort((a, b) => (a.boundAt - b.boundAt) || String(a.deviceId).localeCompare(String(b.deviceId)));
+    ordered.forEach((row, index) => { row.suffix = String(index + 1); });
+  }
+  const out = [];
+  for (const row of rows.values()) {
+    const { modelAt, nameAt, platformAt, osVersionAt, appVersionAt, packageIdAt, buildNumberAt, channelAt, lastSeenFrom, permissionsAt, ...rest } = row;
+    out.push(rest);
+  }
+  // 最近连着的排前面；从没连过的按绑定时间倒序垫后。
+  out.sort((a, b) => (b.lastSeenAt - a.lastSeenAt) || (b.boundAt - a.boundAt));
+  return out;
+}
+
+function historyOut(rows, living) {
+  const out = [];
+  for (const [key, row] of rows) {
+    if (living.has(key)) continue;
+    const { modelAt, nameAt, platformAt, osVersionAt, appVersionAt, lastSeenFrom, ...rest } = row;
+    out.push(rest);
+  }
+  // 最近的结局排前面；同一刻按绑定时间倒序，同一台重配过几次的那条不至于跑到后面。
+  out.sort((a, b) => ((b.revokedAt || b.expiresAt) - (a.revokedAt || a.expiresAt)) || (b.boundAt - a.boundAt));
+  return out;
+}
+
+/**
+ * 面板要的那份设备清单：只画还活着的。
+ *
+ * 按 `deviceId` 聚成一行：同一台手机重配几次不该在列表里重复出现。机型号、名字、平台、
+ * 系统版本、App 版本都取最新一条**有值的**记录（老记录这些字段是空的，空的不能覆盖有值的），
+ * 绑定时间取最早，最近连接取最大，走哪条路取最近那条的。
+ *
+ * **`deviceId` 是这一页唯一的键**：它是手机第一次启动时自己生成的，配对那一刻交给宿主，
+ * 之后每条请求都带着它。名字、机型、平台、版本一概不参与判重 —— 改个名字不该变成两台。
+ *
+ * `bindings` 是这台名下**还有几条活凭据**：同一台手机重配一次就多一条，旧的那条仍然能用。
+ * 大于 1 时面板要把「另有几条旧绑定」摆出来，否则人只在解除绑定那一下看到「2 条凭据」，
+ * 之前一直以为只有一份。
+ *
+ * `suffix` 只在**同一批设备里标题会撞**时给出序号（`1`、`2`…），其余是空串——分组用的就是
+ * 面板拿来当标题的那一格：机型优先，机型空着才用名字。按绑定时间编号：早绑的是 1。
+ * 序号是显示用的，不进库、也不回给手机。
+ *
+ * `legacy` 标的是「这个 deviceId 下还有不带设备密钥的活记录」：那种凭据的吊销杀不掉旧
+ * Bearer，界面上的撤销文案必须区别对待，不能写「立即失效」。
+ *
+ * **不回 hash / hostToken / deviceKey**：那些是凭据与密钥材料，面板只是显示谁连着。
+ */
+function listDevices(instanceId) {
+  return scanDevices(instanceId).active;
+}
+
+/**
+ * 「谁连过这台电脑」：已解绑的那一半。
+ *
+ * `listDevices` 只画还活着的，吊销过的整行消失，于是「前天到底放过哪台手机进来」无从查起；
+ * 而库里本来就留着 `createdAt` / `lastSeenAt` / `revokedAt` / `expiresAt`。这里把它们按
+ * `deviceId` 聚成一行 —— 与活动清单同一把键、同一套取「最新一条有值」的规则，面板两边才能
+ * 对着看。
+ *
+ * **名下有活记录的直接跳过**（不是并进去）：那台设备在上面那张活动清单里已经有一行，
+ * 再在「已解绑」里出现一次就是在骗人 —— 它明明还连着。
+ *
+ * `bindings` 是这一组留下的实际条数（吊销过一次就是一条）。`kind` 按组内有没有过
+ * `revokedAt` 分：有过就是 `revoked`（人主动解的绑），否则 `expired`（自己到期的）。
+ *
+ * 保留窗口与 `prune` 同一个数：两次清理之间库里可能还留着一点边缘数据，查询自己再滤一遍，
+ * 免得「同一份数据列表里有、历史里却算不进去」。
+ *
+ * 纯读：不写盘、不清理，只读副本照常能读。**不回 hash / hostToken / deviceKey**。
+ */
+function listHistory(instanceId) {
+  return scanDevices(instanceId).history;
+}
+
+/**
+ * 设备清单与它的历史一起给：路由那一发要两份（活动清单 + `revokedCount` 的条数），
+ * 分两次调就是把同一份记录扫两遍。命中 `?history=1` 的那一发只调 `listHistory`：
+ * 它不需要活动那张表，别为了对称白建一遍。
+ */
+function listDevicesWithHistory(instanceId) {
+  const { active, history } = scanDevices(instanceId);
+  return { devices: active, history };
+}
+
+/**
+ * 清空本实例的「已解绑」历史：所有已结束的手机记录整条删掉，活着的与电脑网页授权一条不动。
+ *
+ * 「已结束」只认 `isLive` 的反面，与 `scanDevices` 里聚历史那半完全同源 —— 面板看得到的
+ * 历史清得到，同一台重配过就留活 record、删旧 record。超出 30 天窗口的残余也一起收走
+ * （它们本就该被 `prune` 删掉）。返回删掉的条数。只读副本拒绝，理由同 `revoke`。
+ */
+function clearHistory(instanceId) {
+  load();
+  if (readOnly) {
+    const error = new Error('凭据库的只读副本不能清空历史；旁路子进程请经 IPC 交给主进程');
+    error.code = 'READ_ONLY';
+    throw error;
+  }
+  const now = Date.now();
+  const before = records.length;
+  records = records.filter((record) => {
+    if (record.instanceId !== instanceId || record.kind === 'computer') return true;
+    // isLive 为假即已结束（吊销或过期）；活记录留下。判据只有这一处。
+    return isLive(record, now);
+  });
+  const cleared = before - records.length;
+  if (cleared) { rebuildIndex(); save(); }
+  return cleared;
+}
+
+/**
+ * 本实例签发过、仍然有效的凭据摘要，按签发时间从新到旧。
+ *
+ * 中转的离线镜像要在桌面宿主上线之前判断「来读缓存的人是不是配对过的手机」，而它手上只有
+ * 手机发来的整串凭据 —— 这里给出同一口径的 sha256（落盘存的本来就是这个摘要），它自己算
+ * 一遍就能比对。吊销与过期在这里现读现滤。
+ */
+function activeDigests(instanceId) {
+  load();
+  const now = Date.now();
+  const live = [];
+  // 记录只在新签发时追加，倒着走就是 createdAt 倒序：超出上限时被截掉的是最老的。
+  for (let i = records.length - 1; i >= 0 && live.length < MAX_ACTIVE_DIGESTS; i -= 1) {
+    const record = records[i];
+    if (record.instanceId !== instanceId || record.kind === 'computer' || !isLive(record, now)) continue;
+    live.push({ hash: record.hash, ...(record.expiresAt ? { expiresAt: record.expiresAt } : {}) });
+  }
+  return live;
+}
+
+/** 测试用：重置内存态（不动盘）。 */
+function resetForTest() {
+  loaded = false;
+  records = [];
+  byHash = new Map();
+  stamp = null;
+  readOnly = false;
+  lastTouchFlushAt = 0;
+}
+
+module.exports = {
+  FILE,
+  DEFAULT_TTL_MS,
+  MAX_ACTIVE_DIGESTS,
+  HISTORY_RETENTION_MS,
+  prune,
+  issue,
+  find,
+  lookup,
+  isLive,
+  findByKeyId,
+  lookupRemoteByKeyId,
+  touch,
+  renew,
+  refresh,
+  setReadOnly,
+  isReadOnly,
+  listActive,
+  listRemoteComputers,
+  listDevices,
+  listHistory,
+  listDevicesWithHistory,
+  clearHistory,
+  setDevicePermissions,
+  activeDigests,
+  revoke,
+  revokeDevice,
+  revokeAllByInstance,
+  reassignInstance,
+  resetForTest,
+};
