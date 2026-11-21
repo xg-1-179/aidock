@@ -29,7 +29,7 @@ const HOP_BY_HOP = new Set([
   'te', 'trailer', 'transfer-encoding', 'upgrade',
 ]);
 
-function cleanHeaders(raw) {
+function cleanHeaders(raw, req) {
   const out = {};
   for (const [k, v] of Object.entries(raw)) {
     const low = k.toLowerCase();
@@ -39,8 +39,10 @@ function cleanHeaders(raw) {
     if (low === 'x-aidock-edge' || low === 'x-aidock-client') continue;
     out[k] = v;
   }
-  out['x-aidock-edge'] = '1'
-  out['x-aidock-client'] = String((req.socket && req.socket.remoteAddress) || '').replace(/^::ffff:/, '');
+  // 这一枚告诉宿主「这是从公网绕进来的」，六位码页面据此拒绝。
+  out['x-aidock-edge'] = '1';
+  // 真实对端地址：宿主看到的源地址恒为 127.0.0.1，配对限速要靠这一枚区分来源。
+  out['x-aidock-client'] = String((req && req.socket && req.socket.remoteAddress) || '').replace(/^::ffff:/, '');
   return out;
 }
 
@@ -70,7 +72,7 @@ const server = http.createServer((req, res) => {
       port: TARGET_PORT,
       method: req.method,
       path: req.url,
-      headers: cleanHeaders(req.headers),
+      headers: cleanHeaders(req.headers, req),
     },
     (upstream) => {
       res.writeHead(upstream.statusCode || 502, upstream.headers);
