@@ -69,11 +69,18 @@ powershell -ExecutionPolicy Bypass -File scripts/install-direct-task.ps1
 | GET | `/api/mobile/v1/link/panel` | 仅本机 |
 | GET | `/api/mobile/v1/link/code` | 仅本机（面板续期用） |
 | POST | `/api/mobile/v1/link/pair`、`/link/pair2` | 六位码（`X-Aidock-Code` 头） |
-| GET | `/api/mobile/v1/sessions` | 设备凭据（E2EE 签名） |
-| GET | `/api/mobile/v1/session/messages` | 同上 |
-| POST | `/api/mobile/v1/session/send`、`/session/stop` | 同上 |
-| GET | `/api/mobile/v1/session/stream` | 同上（SSE） |
-| POST | `/api/mobile/v1/approval/respond` | 同上 |
+| GET | `/api/mobile/v1/link/sessions` | 设备凭据（E2EE 签名） |
+| GET | `/api/mobile/v1/link/messages` | 同上 |
+| POST | `/api/mobile/v1/link/session/new`、`/link/session/send`、`/link/session/stop` | 同上 |
+| GET | `/api/mobile/v1/link/session/stream` | 同上（SSE） |
+| POST | `/api/mobile/v1/link/approval/respond` | 同上（approve 档） |
+| GET | `/api/mobile/v1/link/session/models`、`/link/agent-presets`、`/link/commands` | 同上（view 档） |
+| POST | `/api/mobile/v1/link/session/select-model` | 同上（config 档） |
+| GET | `/api/mobile/v1/link/workspaces`、`/link/session/search` | 同上 |
+
+> 为什么手机只用 `link/` 别名：宿主给旧路径注册的 handler 早于兼容桥装载，热重载换不掉那份闭包，
+> 于是拿不到 `apiProxy`。别名是一组同实现的薄包装，先 `ensureApiProxyBridge(ctx)` 再转调，
+> 因此不需要重启宿主就能用上。
 
 ## 改代码时的两条边界（踩过）
 
