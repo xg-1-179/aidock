@@ -85,6 +85,31 @@ powershell -ExecutionPolicy Bypass -File scripts/install-direct-task.ps1
 宿主看到的源地址恒为 `127.0.0.1`，换 nginx/frp 时要把这两枚补上，否则所有人都算同一个来源。
 参数表见 [docs/DIRECT.md](docs/DIRECT.md) 第六节。
 
+## 自检脚本（改完插件先跑这个）
+
+仓库里带了一个不依赖任何 npm 包的端到端自检：`tools/selftest.js`。它只用 `node` 自带的
+`fetch` / `crypto`，按手机 App 的真实顺序走一遍，任何一步不通都会给出具体状态码。
+
+```bash
+# 本机：探活 → 面板 → 六位码 → 配对 → 授权解封 → 会话列表 → 历史 → 模型
+node tools/selftest.js
+
+# 再真的建一个会话、发一条消息、挂一次 SSE（会真的跑一轮，产生会话）
+node tools/selftest.js --send --stream
+
+# 走公网转发口（顺带验证 /link/panel、/link/code、/link/qr.svg 被挡成 403）
+node tools/selftest.js --send --stream --base http://<公网IP>:<端口>
+```
+
+退出码 0 = 全过，1 = 有 FAIL。常用参数：`--base`（默认 `http://127.0.0.1:3080`）、
+`--code <六位码>`、`--send`、`--stream`。
+
+**一个已知的口径差异**：`/api/mobile/v1/health` 这条路由是插件早期一代注册的，
+`POST /api/relay/reload-implementation` 只换模块、不会重新注册已存在的路由，所以它闭包里
+那份 `state` 停在重启前那一代，`instanceId` 可能还是旧值（自检会打印一行提示）。**实例号
+一律以 `/link/info` 为准**；用旧实例号派生 `pairKey` 会导致配对恒 401。重启一次宿主
+node 进程后 `/health` 才会跟上（离线补丁已把 health 改为从 `relay.json` 现读实例号）。
+
 ## 端点（手机侧用到的）
 
 | 方法 | 路径 | 鉴权 |
