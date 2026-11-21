@@ -248,6 +248,13 @@ async function main() {
     skip('新建会话 / 发消息 / SSE', '加 --send（和 --stream）才会真的跑一轮');
   }
 
+  // 8.5) 挂着的卡查询：审批/提问帧不带 seq，重连不会回放，手机靠这条把卡补回界面。
+  {
+    const pendingRes = await client.call('GET', '/api/mobile/v1/link/pending', '?sessionId=nonexistent');
+    const pending = pendingRes.json || {};
+    check('挂着卡查询 /link/pending', pendingRes.status === 200 && pending.ok === true, `status=${pendingRes.status} approval=${pending.approval ? '有' : '无'} question=${pending.question ? '有' : '无'}`);
+  }
+
   // 9) 可选：公网口安全边界（两份 base 都给时才跑）。
   if (PUBLIC_BASE) {
     const pubCode = await fetch(PUBLIC_BASE + '/api/mobile/v1/link/code');
