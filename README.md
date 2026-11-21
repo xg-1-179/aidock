@@ -61,6 +61,16 @@ powershell -ExecutionPolicy Bypass -File scripts/install-direct-task.ps1
 
 细节与验证命令见 [docs/DIRECT.md](docs/DIRECT.md)。
 
+### 配对限速（防六位码被爆破）
+
+公网口开着时，六位码只有 100 万种组合，必须限速。插件在 `lib/routes/mobile-api.js`
+的 `aidockPairGuard` 里做：同一来源 10 分钟内**码不对**满 8 次即回 `429`（带 `retry-after`），
+全机累计失败 20 次直接作废当前连接码。只有「码不对」计数——码对了、封包坏了不锁人。
+
+来源靠转发层盖的两枚章区分：`x-aidock-edge: 1`（公网来路）与 `x-aidock-client: <真实对端 IP>`；
+宿主看到的源地址恒为 `127.0.0.1`，换 nginx/frp 时要把这两枚补上，否则所有人都算同一个来源。
+参数表见 [docs/DIRECT.md](docs/DIRECT.md) 第六节。
+
 ## 端点（手机侧用到的）
 
 | 方法 | 路径 | 鉴权 |
