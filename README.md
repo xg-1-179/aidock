@@ -17,12 +17,12 @@
 ## 装法
 
 ```bash
-# 1) 从 GitHub 装（推荐；需要 dsh >= 0.2.0）
-dsh plugin --profile web add github:xg-1-179/aidock
-
-# 2) 本地源码 / 打包出来的 tgz
-npm pack                                  # 生成 aidock-0.1.0.tgz
+# 1) 打包后按文件装（本机实测可行；github.com 直连不通的机器走这条）
+git clone https://github.com/xg-1-179/aidock && cd aidock && npm pack
 dsh plugin --profile web add "file:<绝对路径>/aidock-0.1.0.tgz"
+
+# 2) 若这台机器能直连 github.com，也可以让 pnpm 自己拉
+dsh plugin --profile web add github:xg-1-179/aidock
 ```
 
 装完后：
