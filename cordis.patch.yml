@@ -18,4 +18,4 @@
 # 无头宿主的挂载点。
 - insert:
     - id: dsh-mobile
-      name: 'dsh-mobile-plugin'
+      name: 'aidock'
