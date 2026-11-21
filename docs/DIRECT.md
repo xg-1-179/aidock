@@ -64,3 +64,15 @@ curl http://<公网IP>:41873/api/mobile/v1/link/info
 
 两个都 200，就说明手机可以直连了：App 里填 `http://<公网IP>:41873`，再输入电脑上面板显示的
 六位码。
+
+## 六、安全边界（务必保留）
+
+转发层会给公网来路统一盖上 `x-aidock-edge: 1`，并直接挡掉
+`/api/mobile/v1/link/code` 与 `/api/mobile/v1/link/panel`（403 `local-only`）。
+原因是这两个页面带着六位连接码，而宿主看到的源地址恒为 `127.0.0.1`——光看源地址
+分不出「真坐在电脑前」还是「从公网绕进来的人」。六位码只在电脑本机的
+`http://127.0.0.1:3080/api/mobile/v1/link/panel` 可见。
+
+换成别的转发器（nginx、frp、Cloudflare Tunnel）时，这两个路径要自己加同样的限制，
+否则任何人打开 `http://<公网IP>:<端口>/api/mobile/v1/link/panel` 就能拿到码，
+配出一台十项权限全开的设备。
