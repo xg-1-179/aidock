@@ -43,9 +43,7 @@ import {
  */
 const WEB_PROFILE_BUNDLES = ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app']
 
-// 包名以 package.json 为准：派生版叫 aidock，上游叫 dsh-mobile-plugin。
-// 写死会让改名后的包在无头宿主里摘不掉「按裸包名自挂」那一行（解析失败 → 整棵树加载失败）。
-const BIN_NAME = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).name
+const BIN_NAME = 'dsh-mobile-plugin'
 const PROFILE_NAME = process.env.DSH_MOBILE_PROFILE || 'mobile'
 const PACKAGE_DIR = dirname(fileURLToPath(import.meta.url))
 // The bundle layer fallback resolves plugins out of the installing package's

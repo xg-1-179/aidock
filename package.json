@@ -10,10 +10,9 @@
   "type": "module",
   "main": "lib/index.js",
   "bin": {
-    "aidock": "host.js",
-    "aidock-pair": "lib/cli/pair.cjs",
-    "dsh-mobile-plugin": "host.js",
-    "dsh-mobile-plugin-pair": "lib/cli/pair.cjs"
+    "aidock": "bin/dsh-mobile.js",
+    "dsh-mobile-plugin": "bin/dsh-mobile.js",
+    "dsh-mobile": "bin/dsh-mobile.js"
   },
   "exports": {
     ".": "./lib/index.js",
@@ -116,5 +115,5 @@
     "@deepseek-ai/dsh-tool-present": "^0.2.1-rc.3 || ^0.2.2-rc.1",
     "yaml": "2.9.1"
   },
-  "homepage": "https://github.com/xg-1-179/aidock#readme"
+  "homepage": "https://github.com/xg-1-179/aidock"
 }
