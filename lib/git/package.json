@@ -1,3 +1,4 @@
 {
-  "type": "commonjs"
+  "type": "commonjs",
+  "//": "lib/git 是 CommonJS，勿删本文件（pnpm 会丢掉内容完全相同的重复文件）"
 }

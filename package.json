@@ -9,11 +9,6 @@
   },
   "type": "module",
   "main": "lib/index.js",
-  "bin": {
-    "aidock": "bin/dsh-mobile.js",
-    "dsh-mobile-plugin": "bin/dsh-mobile.js",
-    "dsh-mobile": "bin/dsh-mobile.js"
-  },
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
@@ -59,7 +54,8 @@
     "docs/extension-authoring.md",
     "docs/chat-embed.md",
     "docs/extension-sample/**",
-    "README.md"
+    "README.md",
+    "tools/**"
   ],
   "publishConfig": {
     "registry": "https://registry.npmjs.org/",

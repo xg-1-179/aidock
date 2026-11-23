@@ -90,9 +90,30 @@ App 里预置了由项目运营的默认中转地址，开箱就能连；也支�
 
 装好手机 App 只是第一步，插件装在这边才算接通。
 
-在 DeepSeek Harness 的 **设置 → 插件** 里搜索并安装 `dsh-mobile-plugin` 进行安装，然后打开 **设置 → 移动端 → 打开配置页面** 做配对。配对二维码、当前监听地址和中转状态都在那一页，手机上的所有功能都从这页开始。插件会自动更新，通常更新后不用重启 DeepSeek Harness。
+本机（没有外网 npm 也能装）：
 
-想在没有屏幕的服务器上跑，见 [无头部署与配置接口](docs/headless-deploy.md)，本机接口、移动 API 和会话清理的说明都在那里。
+```sh
+git clone https://github.com/xg-1-179/aidock.git && cd aidock
+npm pack                                  # 得到 aidock-<版本>.tgz
+dsh plugin --profile web add "file:<绝对路径>/aidock-<版本>.tgz"
+```
+
+装完先自检一遍，能提前挡掉「文件没进包」「命令是死链接」「客户端没注册」这类装完才暴露的问题：
+
+```sh
+node tools/check-install.mjs ~/.dsh/profiles/web/node_modules/aidock
+```
+
+七项全 `ok` 就说明包装完整。然后托盘退出 DeepSeek Harness 再打开（换包必须重启宿主进程）。
+
+**连接界面在哪**：侧边栏最底部「更多」右边那颗手机图标（悬停会显示设备数与上次连接时间），点它直接打开配置页；也可以走 **设置 → 移动端 → 打开配置页面**，或在本机浏览器打开 `http://127.0.0.1:3080/api/mobile/v1/link/panel`。配置页上有六位连接码、二维码、当前监听地址与中转状态，手机上的所有功能都从这页开始。
+
+想在没有屏幕的服务器上跑，见 [无头部署与配置接口](docs/headless-deploy.md)。
+
+### 打包时的两个坑（已修，改包时别踩回去）
+
+1. **同内容文件会被合并**：`lib/` 下 6 个 `{"type":"commonjs"}` 标记文件原本字节完全相同，pnpm 会把它们硬链成同一个 inode，装完只留一个，剩下的目录被当 ESM 解析，启动直接报 `dshHome` 找不到。现在每个标记的内容都不同（带一行说明注释），`tools/check-install.mjs` 会检查这一点。
+2. **客户端注册名必须等于包名**：`lib/client.js` 里 `__ModuleLoader__.load({ id })` 的 id 写成旧名 `dsh-mobile-plugin` 时，bundle 能加载但不会被注册，设置里的卡片和侧边栏图标全都不出现，控制台报 `loaded without registering`。
 
 ### 自动更新与更新校验
 
